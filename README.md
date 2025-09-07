@@ -1,135 +1,115 @@
 # GPT2ART-1
 
-Perfect 🙌 — let’s sketch a **hybrid GPT-2 + Adaptive Resonance (ART)** setup in PyTorch.
-The idea:
+Nice 😎 — let’s couple **ART** back into GPT-2’s training so it actually *influences* learning, not just clusters passively.
 
-1. Use **GPT-2** for text encoding/decoding.
-2. Add a lightweight **ART module** that clusters GPT-2’s hidden states.
-3. During training, GPT-2 still learns via gradient descent, but ART clusters act as a **non-parametric memory**:
-
-   * If hidden states resonate (similar enough to an existing cluster), reinforce it.
-   * Otherwise, create a new cluster.
-
-This gives GPT-2 a stability–plasticity mechanism like ART.
+We’ll do this by adding an **ART regularization loss** on top of GPT-2’s normal cross-entropy loss.
 
 ---
 
-# 🔹 ART Module (PyTorch)
+# 🔹 Idea: ART regularization
 
-A very simplified ART-1–style module for continuous embeddings:
+1. GPT-2 predicts normally → `loss_ce` (cross entropy).
+2. Get hidden state embeddings.
+3. ART checks if the embedding resonates with an existing cluster:
+
+   * If yes → pull the embedding **closer** to that prototype (consistency).
+   * If no → allow a new cluster, but penalize drift to keep stability.
+4. Total loss = `loss_ce + λ * loss_art`.
+
+This way:
+
+* **Cross entropy** teaches GPT-2 to predict text.
+* **ART regularizer** shapes embeddings into stable categories (resonance).
+
+---
+
+# 🔹 ART Loss
+
+We can define it as a distance between embedding and its matched prototype.
 
 ```python
-import torch
+def art_loss_fn(embedding, art, device="cpu"):
+    """
+    embedding: (1, hidden_dim)
+    art: SimpleART instance
+    """
+    if not art.prototypes:
+        # no prototypes yet → no penalty
+        art.prototypes.append(embedding.detach().clone())
+        return torch.tensor(0.0, device=device)
 
-class SimpleART:
-    def __init__(self, vigilance=0.75, device="cpu"):
-        self.vigilance = vigilance
-        self.prototypes = []  # stored cluster centers
-        self.device = device
+    sims = torch.cat([torch.nn.functional.cosine_similarity(embedding, p).unsqueeze(0) for p in art.prototypes])
+    best_idx = torch.argmax(sims).item()
+    best_sim = sims[best_idx].item()
 
-    def _similarity(self, x, y):
-        # cosine similarity
-        return torch.nn.functional.cosine_similarity(x, y, dim=-1)
-
-    def update(self, embedding):
-        """
-        embedding: (1, hidden_dim)
-        """
-        if not self.prototypes:
-            self.prototypes.append(embedding.clone())
-            return 0, "new"  # first category
-
-        # check similarity with existing categories
-        sims = torch.cat([self._similarity(embedding, p).unsqueeze(0) for p in self.prototypes])
-        best_idx = torch.argmax(sims).item()
-        best_sim = sims[best_idx].item()
-
-        if best_sim >= self.vigilance:
-            # resonance: update prototype (moving average)
-            self.prototypes[best_idx] = 0.5 * (self.prototypes[best_idx] + embedding)
-            return best_idx, "resonated"
-        else:
-            # no match: create new category
-            self.prototypes.append(embedding.clone())
-            return len(self.prototypes)-1, "new"
+    if best_sim >= art.vigilance:
+        # resonance → encourage embedding to stay close
+        proto = art.prototypes[best_idx].detach()
+        return 1 - torch.nn.functional.cosine_similarity(embedding, proto).mean()
+    else:
+        # new category → small penalty for drift
+        return torch.tensor(0.1, device=device)  # encourage but don’t forbid novelty
 ```
 
 ---
 
-# 🔹 Connecting GPT-2 to ART
-
-We grab hidden states from GPT-2 and feed them into ART.
+# 🔹 Training Loop with ART-Coupled Loss
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
+# Setup
 device = "cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 model = AutoModelForCausalLM.from_pretrained("gpt2", output_hidden_states=True).to(device)
-
-art = SimpleART(vigilance=0.8, device=device)
-
-prompt = "Translate 'bonjour' to English:"
-inputs = tokenizer(prompt, return_tensors="pt").to(device)
-
-with torch.no_grad():
-    outputs = model(**inputs)
-    hidden = outputs.hidden_states[-1]  # last layer hidden states
-    emb = hidden.mean(dim=1)            # average pooling → (1, hidden_dim)
-
-cluster_id, status = art.update(emb)
-print(f"Cluster {cluster_id}, status={status}, total clusters={len(art.prototypes)}")
-```
-
----
-
-# 🔹 Training Loop with ART
-
-* Normal GPT-2 training uses a **loss** (like cross-entropy).
-* ART is updated **separately**, not with backprop.
-* You can log ART’s clusters to see if GPT-2’s hidden states are becoming more organized.
-
-```python
-loss_fn = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
+# ART module
+art = SimpleART(vigilance=0.8, device=device)
+lambda_art = 0.1  # weight for ART regularizer
+
 for step, batch in enumerate(dataloader):
-    inputs = tokenizer(batch["prompt"], return_tensors="pt", padding=True).to(device)
-    labels = tokenizer(batch["target"], return_tensors="pt", padding=True).input_ids.to(device)
+    inputs = tokenizer(batch["prompt"], return_tensors="pt", padding=True, truncation=True).to(device)
+    labels = tokenizer(batch["target"], return_tensors="pt", padding=True, truncation=True).input_ids.to(device)
 
     outputs = model(**inputs, labels=labels)
-    loss = outputs.loss
+    loss_ce = outputs.loss
 
+    # embeddings = mean last hidden states
+    emb = outputs.hidden_states[-1].mean(dim=1)
+    loss_art = art_loss_fn(emb, art, device=device)
+
+    # total loss
+    loss = loss_ce + lambda_art * loss_art
+
+    # update GPT-2
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
 
-    # Update ART with hidden states
-    hidden = outputs.hidden_states[-1].mean(dim=1)
-    cluster_id, status = art.update(hidden)
-    print(f"Step {step}: Loss={loss.item():.4f}, Cluster={cluster_id}, Status={status}")
+    # update ART memory (not via gradients)
+    art.update(emb.detach())
+
+    print(f"Step {step}: CE={loss_ce.item():.4f}, ART={loss_art.item():.4f}, Total={loss.item():.4f}, Clusters={len(art.prototypes)}")
 ```
 
 ---
 
-# 🔹 What you get
+# 🔹 What this does
 
-* GPT-2 trains normally with gradients.
-* ART runs in parallel, clustering hidden states into categories.
-* ART gives you:
-
-  * **Resonance reports**: whether a new input fit an existing category.
-  * **New categories** when GPT-2 faces unfamiliar input.
-  * A possible **continual learning extension**: re-train GPT-2 only when ART signals “new” categories.
+* **Cross entropy loss** trains GPT-2 as usual.
+* **ART loss** pushes embeddings toward stable prototypes, but still allows novelty.
+* ART dynamically grows categories while GPT-2 learns — preventing embeddings from drifting chaotically.
 
 ---
 
-✅ **Summary**
+# ✅ Benefits
 
-* Directly training GPT-2 with ART is infeasible.
-* But you can **hybridize ART as a memory/clustering module** on top of GPT-2’s embeddings.
-* This helps with **continual learning**, **novelty detection**, and potentially **catastrophic forgetting prevention**.
+* Adds **continual learning stability**.
+* Encourages **semantic clustering** of hidden states.
+* Provides a **novelty detector** (new categories form when GPT-2 sees unseen patterns).
 
 ---
 
-👉 Do you want me to extend this so the ART **feeds back into GPT-2’s loss** (e.g., add a penalty if embeddings drift too far from their cluster), making it a *true coupled training* system rather than just a parallel memory?
+👉 Do you want me to extend this into a **full Hugging Face `Trainer` subclass** so you can drop this ART-regularized loss into your normal fine-tuning workflow (instead of a manual loop)?
